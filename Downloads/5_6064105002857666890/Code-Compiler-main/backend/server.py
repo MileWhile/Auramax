@@ -12,8 +12,8 @@ from pydantic import BaseModel, Field, HttpUrl
 from typing import List, Dict, Any
 import uuid
 import asyncio
-import mimetypes
 import itertools
+from unstructured.partition.auto import partition
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
 # --- Correct Environment Variable Loading ---
@@ -55,89 +55,77 @@ class QueryResponse(BaseModel):
 security = HTTPBearer()
 async def verify_bearer_token(credentials = Depends(security)):
     secret_token = os.environ.get("BEARER_TOKEN")
-    if not secret_token:
-        raise HTTPException(status_code=500, detail="BEARER_TOKEN is not configured.")
-    if credentials.credentials != secret_token:
-        raise HTTPException(status_code=403, detail="Invalid or missing bearer token.")
+    if not secret_token: raise HTTPException(500, "BEARER_TOKEN not configured.")
+    if credentials.credentials != secret_token: raise HTTPException(403, "Invalid token.")
     return credentials
 
 # --- Helper Functions ---
 @retry(wait=wait_random_exponential(max=5), stop=stop_after_attempt(3))
-async def download_document(url: str):
+async def download_document(url: str) -> bytes:
     import httpx
-    async with httpx.AsyncClient(timeout=25.0) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.get(url)
         r.raise_for_status()
         return r.content
 
-@retry(wait=wait_random_exponential(max=10), stop=stop_after_attempt(3))
-async def answer_from_document_directly(content: bytes, filename: str, questions: List[str]) -> List[str]:
-    """Sends the PDF and all questions in a single, highly-instructed call."""
-    from emergentintegrations.llm.chat import LlmChat, UserMessage, FileContentWithMimeType
-    
-    q_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
-    
-    # THE FINAL, ULTIMATE PROMPT
-    prompt = f"""
-    **ROLE:** You are a Digital Documentation Auditor AI.
-    **TASK:** Analyze the attached document and provide precise, detailed answers to all questions listed below. Your performance is judged on accuracy and thoroughness.
-
-    **CRITICAL RULES:**
-    1.  **Comprehensive Search:** You MUST search the entire document for each answer. Failure to find an answer that is present in the document is a critical error.
-    2.  **Strict Context:** Your answers must be based **exclusively** on the text within the attached document. Do not use any external knowledge.
-    3.  **Clean Output:** Do NOT repeat the questions, do NOT add introductory text, and do NOT add numbering to your answers.
-    4.  **Separator:** You MUST separate each answer from the next using the exact string '---ANSWER---'.
-    5.  **Handle Missing Data:** If, and only if, after a complete search you cannot find an answer, you MUST respond with the specific phrase: "After a thorough review, the answer to this question could not be located in the provided document."
-
-    **QUESTIONS TO ANSWER:**
-    {q_block}
-    """
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix) as tf:
-        tf.write(content)
+def extract_text_with_unstructured(pdf_content: bytes) -> str:
+    """Reliably extracts structured text and tables using the unstructured library."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tf:
+        tf.write(pdf_content)
         temp_file_path = tf.name
     try:
-        chat = LlmChat(
-            api_key=get_next_api_key(), 
-            session_id=str(uuid.uuid4()), 
-            system_message="You are an AI assistant that follows instructions precisely."
-        ).with_model("gemini", "gemini-2.0-flash")
-        
-        mime, _ = mimetypes.guess_type(filename) or ('application/pdf', None)
-        file_attachment = FileContentWithMimeType(file_path=temp_file_path, mime_type=mime)
-        
-        msg = UserMessage(text=prompt, file_contents=[file_attachment])
-        resp = await chat.send_message(msg)
-        
-        answers = [a.strip() for a in resp.split('---ANSWER---')]
-        if len(answers) < len(questions):
-            answers.extend(["Error: AI failed to provide a valid response for this question."] * (len(questions) - len(answers)))
-        return answers[:len(questions)]
+        elements = partition(filename=temp_file_path, strategy="hi_res")
+        return "\n\n".join([str(el) for el in elements])
     finally:
         os.unlink(temp_file_path)
+
+@retry(wait=wait_random_exponential(max=10), stop=stop_after_attempt(3))
+async def answer_questions_from_context(questions: List[str], context: str) -> List[str]:
+    from emergentintegrations.llm.chat import LlmChat, UserMessage
+    q_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
+    prompt = f"""**ROLE:** You are an AI Documentation Auditor.
+**TASK:** Provide a detailed and complete answer for every question below, based ONLY on the provided DOCUMENT CONTEXT.
+**CRITICAL RULES:**
+1. **Be Thorough:** Your primary goal is accuracy. Scan the entire document context. Failure to find an answer is a critical error.
+2. **Clean Output:** Your response MUST ONLY contain the answers. Do NOT repeat questions, use numbering, or add intros.
+3. **Separator:** You MUST separate each answer with '---ANSWER---'.
+4. **Missing Data:** If an answer is not in the document, respond with: "The answer to this question could not be found in the document."
+
+**DOCUMENT CONTEXT:**
+---
+{context}
+---
+**QUESTIONS TO ANSWER:**
+{q_block}
+"""
+    chat = LlmChat(api_key=get_next_api_key(), session_id=str(uuid.uuid4()), system_message="You are a document analysis AI.").with_model("gemini", "gemini-2.0-flash")
+    msg = UserMessage(text=prompt)
+    resp = await chat.send_message(msg)
+    answers = [a.strip() for a in resp.split('---ANSWER---')]
+    if len(answers) < len(questions):
+        answers.extend(["Error: AI response malformed or incomplete."] * (len(questions) - len(answers)))
+    return answers[:len(questions)]
 
 # --- API Endpoints ---
 @api_router.get("/health")
 async def health_check():
     return {"status": "healthy" if api_keys_list else "unhealthy"}
 
-@api_router.post("/hackrx/run", response_model=QueryResponse, dependencies=[Depends(verify_bearer_token)])
+@api_ōuter.post("/hackrx/run", response_model=QueryResponse, dependencies=[Depends(verify_bearer_token)])
 async def process_document_and_wait(request: QueryRequest):
     start_time = asyncio.get_event_loop().time()
     try:
         content = await download_document(str(request.documents))
-        clean_filename = Path(str(request.documents)).name.split('?')[0]
-        answers = await answer_from_document_directly(content, clean_filename, request.questions)
+        
+        # New, reliable text extraction that understands tables
+        context = extract_text_with_unstructured(content)
+        
+        answers = await answer_questions_from_context(request.questions, context)
         
         processing_time = asyncio.get_event_loop().time() - start_time
-        logging.info(f"Request completed in {processing_time:.2f} seconds.")
-        
-        if processing_time > 30:
-            logging.warning(f"WARNING: Request took {processing_time:.2f} seconds, exceeding the 30-second target.")
-
         return QueryResponse(
             answers=answers,
-            metadata={"document_name": clean_filename},
+            metadata={"document_name": Path(str(request.documents)).name.split('?')[0]},
             processing_time=processing_time,
             request_id=str(uuid.uuid4())
         )
